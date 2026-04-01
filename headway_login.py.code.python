@@ -1,0 +1,227 @@
+from playwright.sync_api import sync_playwright
+import time
+import re
+import os
+from dotenv import load_dotenv
+
+# 載入 .env 檔案
+load_dotenv()
+
+# ==============================
+# 🔧 從 .env 讀取帳號密碼
+# ==============================
+EMAIL    = os.getenv("HEADWAY_EMAIL")
+PASSWORD = os.getenv("HEADWAY_PASSWORD")
+
+def sanitize_filename(name: str) -> str:
+    """將書名轉為合法檔名：空格換底線，移除特殊字元"""
+    name = name.strip()
+    name = re.sub(r'[\\/*?:"<>|]', '', name)
+    name = re.sub(r'\s+', '_', name)
+    return name
+
+def extract_page_content(page, book_title) -> str:
+    """擷取當前閱讀頁面的主要文字內容，並過濾掉導覽 UI 與重複標題"""
+    return page.evaluate("""([title, blacklist]) => {
+        const elements = document.querySelectorAll('h1, h2, h3, h4, p, ul li, ol li');
+        let text = [];
+        elements.forEach(el => {
+            const t = (el.innerText || "").trim();
+            const isBlacklisted = blacklist.some(b => t === b);
+            const isDuplicateTitle = (t === title);
+            const isTimestamp = /^\\d{2}:\\d{2}$/.test(t);
+            const isTooShort = t.length < 1;
+
+            if (!isTooShort && !isBlacklisted && !isDuplicateTitle && !isTimestamp) {
+                if (el.tagName.startsWith('H')) {
+                    text.push('\\n### ' + t + '\\n');
+                } else if (el.tagName === 'LI') {
+                    text.push('- ' + t);
+                } else {
+                    text.push(t + '\\n');
+                }
+            }
+        });
+        return text.join('\\n');
+    }""", [book_title, ["Discover", "Library", "Infographics", "Profile"]])
+
+def login_headway():
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        context = browser.new_context()
+        page = context.new_page()
+
+        BASE_URL = "https://app.makeheadway.com"
+        START_URL = f"{BASE_URL}/discover"
+        
+        print(f"🚀 前往探索頁面: {START_URL}")
+        page.goto(START_URL, wait_until="domcontentloaded")
+
+        try:
+            page.wait_for_selector("input[name='email']", timeout=8000)
+            print("📧 偵測到登入頁面，自動填入帳號密碼...")
+            page.fill("input[name='email']", EMAIL)
+            page.fill("input[name='password']", PASSWORD)
+            page.click("button[type='submit']")
+            page.wait_for_load_state("networkidle")
+            print("✅ 登入完成。")
+        except:
+            print("ℹ️ 登入步驟跳過或已登入。")
+
+        # ----------------------------------------------------
+        # 💉 注入手動啟動按鈕 (恢復回 Python 主動注入版)
+        # ----------------------------------------------------
+        def inject_start_button(p_obj):
+            if p_obj.is_closed(): return
+            try:
+                p_obj.evaluate("""() => {
+                    if (!document.body) return;
+                    if (document.getElementById('headway-downloader')) {
+                        const existing = document.getElementById('headway-downloader');
+                        if (window.__headway_ready__ === false && existing.innerText.includes('準備就緒')) {
+                            existing.innerText = '📥 開始抓取此書內容';
+                            existing.style.background = '#E91E63';
+                        }
+                        return;
+                    }
+                    const btn = document.createElement('button');
+                    btn.id = 'headway-downloader';
+                    btn.innerText = '📥 開始抓取此書內容';
+                    btn.style.cssText = `
+                        position: fixed; top: 110px; left: 10px;
+                        z-index: 999999; padding: 12px 24px;
+                        background: #E91E63; color: white;
+                        border: none; border-radius: 5px; cursor: pointer; font-weight: bold;
+                        box-shadow: 0 5px 15px rgba(0,0,0,0.5); font-size: 14px;
+                    `;
+                    btn.onclick = () => {
+                        window.__headway_ready__ = true;
+                        btn.innerText = '✅ 準備就緒，Python 正在抓取...';
+                        btn.style.background = '#4CAF50';
+                    };
+                    document.body.appendChild(btn);
+                }""")
+            except: pass
+
+        inject_start_button(page)
+        page.on("framenavigated", lambda f: inject_start_button(page) if not page.is_closed() and f == page.main_frame else None)
+
+        # ----------------------------------------------------
+        # 🔄 連續抓取迴圈
+        # ----------------------------------------------------
+        while True:
+            try:
+                page.evaluate("window.__headway_ready__ = false")
+                inject_start_button(page)
+            except: 
+                if page.is_closed(): break
+                time.sleep(1)
+                continue
+
+            print("\n" + "="*55)
+            print("💡 請在網頁中找到書後，點選左上角的按鈕啟動抓取。")
+            print("="*55)
+
+            # 等待使用者點擊按鈕
+            try:
+                while not page.evaluate("() => window.__headway_ready__ === true"):
+                    time.sleep(1)
+                    if page.is_closed(): return
+            except: break
+
+            # 抓取目前的目標與書名
+            current_url = page.url
+            match = re.search(r'(/books/[^/?#]+)', current_url)
+            target_base_url = f"{BASE_URL}{match.group(1)}" if match else current_url
+
+            book_info = page.evaluate("""() => {
+                const h1 = document.querySelector('h1[class*="MuiTypography-b16"], h1');
+                const title = h1 ? h1.innerText.trim() : 'Unknown_Book';
+                const cvBox = document.querySelector('.mui-style-h90r6p');
+                let cvUrl = "";
+                if (cvBox && cvBox.querySelector('img')) cvUrl = cvBox.querySelector('img').src;
+                if (!cvUrl && document.querySelector('img[alt*="cover"]')) cvUrl = document.querySelector('img[alt*="cover"]').src;
+                return { title, cvUrl };
+            }""")
+            
+            book_title = book_info['title']
+            cover_url = book_info['cvUrl']
+            folder_name = sanitize_filename(book_title)
+            os.makedirs(folder_name, exist_ok=True)
+
+            print(f"📚 書名: {book_title}")
+            
+            # 下載封面
+            if cover_url:
+                try:
+                    img_data = page.request.get(cover_url).body()
+                    with open(os.path.join(folder_name, "cover.jpg"), "wb") as f:
+                        f.write(img_data)
+                    print(f"✅ 封面圖片下載完成。")
+                except: pass
+
+            # 📖 逐頁抓取內文
+            print(f"📖 正在抓取全書內文...")
+            all_pages_text = []
+            page_num = 1
+            prev_content = ""
+            
+            while True:
+                summary_url = f"{target_base_url}/summary?page={page_num}"
+                print(f"➡️ Page {page_num}...", end="\r")
+                try:
+                    response = page.goto(summary_url, wait_until="domcontentloaded")
+                    time.sleep(2.0)
+                    if "summary?page=" not in page.url or (response and response.status == 404): break
+                    
+                    content = extract_page_content(page, book_title)
+                    if not content.strip() or content == prev_content: break
+                        
+                    all_pages_text.append(f"## Page {page_num}\n{content}")
+                    prev_content = content
+                    if page_num > 3 and "conclusion" in content.lower():
+                        print(f"\n🛑 偵測到 Conclusion，抓取完畢。")
+                        break
+                    page_num += 1
+                except: break
+
+            # 👤 抓取作者資訊
+            print("\n👤 抓取作者資訊...")
+            try:
+                page.goto(target_base_url, wait_until="domcontentloaded")
+                time.sleep(1.5)
+                author_info = page.evaluate("""() => {
+                    const findSec = (keywords) => {
+                        const els = Array.from(document.querySelectorAll('h1, h2, h3, h4, div, span, p, li'));
+                        const t = els.find(el => {
+                            const txt = (el.innerText || '').trim().toLowerCase();
+                            return keywords.some(k => txt === k || (txt.replaceAll(' ', '').includes(k.replaceAll(' ', ''))));
+                        });
+                        if (t) {
+                            let c = t.closest('section') || t.parentElement;
+                            if (c && c.innerText.length < 50) c = c.parentElement;
+                            return c ? c.innerText.trim() : '（無內容）';
+                        }
+                        return '（未找到）';
+                    };
+                    return findSec(["about the author", "author info"]);
+                }""")
+            except: author_info = "（抓取失敗）"
+
+            # 📝 儲存 Markdown
+            md_text = f"# {book_title}\n\n"
+            if cover_url: md_text += "![Cover](cover.jpg)\n\n"
+            md_text += f"> 來源：{target_base_url}\n> 擷取時間：{time.strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n"
+            md_text += "\n\n---\n\n".join(all_pages_text)
+            md_text += f"\n\n---\n\n## About the Author\n\n{author_info}\n"
+
+            save_path = os.path.join(folder_name, f"Summary_{folder_name}.md")
+            with open(save_path, "w", encoding="utf-8") as f:
+                f.write(md_text)
+
+            print(f"🎉 【{book_title}】 下載完成！")
+            print("-" * 55)
+            time.sleep(1)
+
+if __name__ == "__main__":
+    login_headway()

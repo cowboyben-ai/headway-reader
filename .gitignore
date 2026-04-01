@@ -1,0 +1,13 @@
+.env
+.venv/
+__pycache__/
+.DS_Store
+Summary_*/
+Atomic_Habits/
+Dopamine_Nation/
+Rework/
+Self-Discipline_in_Difficult_Times/
+The_XX_Brain/
+Unlimited_Memory/
+The_First_Minute/
+
