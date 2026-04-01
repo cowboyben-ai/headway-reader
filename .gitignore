@@ -2,12 +2,15 @@
 .venv/
 __pycache__/
 .DS_Store
-Summary_*/
+.playwright/
+# 書籍資料夾
 Atomic_Habits/
 Dopamine_Nation/
+Irrational_Exuberance/
 Rework/
 Self-Discipline_in_Difficult_Times/
+Side_Hustle/
+The_First_Minute/
 The_XX_Brain/
 Unlimited_Memory/
-The_First_Minute/
 
